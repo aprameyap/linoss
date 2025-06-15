@@ -19,8 +19,7 @@ import pickle
 from dataclasses import dataclass
 from typing import Dict
 
-import jax.numpy as jnp
-import jax.random as jr
+import torch
 import numpy as np
 
 from data_dir.dataloaders import Dataloader
@@ -36,69 +35,96 @@ class Dataset:
     path_dataloaders: Dict[str, Dataloader]
     data_dim: int
     logsig_dim: int
-    intervals: jnp.ndarray
+    intervals: torch.Tensor
     label_dim: int
 
 
-def batch_calc_paths(data, stepsize, depth, inmemory=True):
+def jax_to_torch(obj, device=None):
+    """Convert JAX arrays to PyTorch tensors when loading from pickle."""
+    if device is None:
+        device = torch.device('cpu')
+    
+    if hasattr(obj, 'shape'):  # JAX array or numpy array
+        return torch.from_numpy(np.array(obj)).to(device)
+    elif isinstance(obj, (list, tuple)):
+        return type(obj)(jax_to_torch(item, device) for item in obj)
+    else:
+        return obj
+
+
+def batch_calc_paths(data, stepsize, depth, inmemory=True, device=None):
+    """Calculate paths in batches to manage memory."""
+    if device is None:
+        device = data.device if hasattr(data, 'device') else torch.device('cpu')
+    
     N = len(data)
     batchsize = 128
     num_batches = N // batchsize
     remainder = N % batchsize
     path_data = []
+    
     if inmemory:
         out_func = lambda x: x
         in_func = lambda x: x
     else:
-        out_func = lambda x: np.array(x)
-        in_func = lambda x: jnp.array(x)
+        out_func = lambda x: x.cpu().numpy()
+        in_func = lambda x: torch.from_numpy(x).to(device) if not isinstance(x, torch.Tensor) else x.to(device)
+    
     for i in range(num_batches):
+        batch_data = data[i * batchsize : (i + 1) * batchsize]
         path_data.append(
-            out_func(
-                calc_paths(
-                    in_func(data[i * batchsize : (i + 1) * batchsize]), stepsize, depth
-                )
-            )
+            out_func(calc_paths(in_func(batch_data), stepsize, depth))
         )
+    
     if remainder > 0:
+        batch_data = data[-remainder:]
         path_data.append(
-            out_func(calc_paths(in_func(data[-remainder:]), stepsize, depth))
+            out_func(calc_paths(in_func(batch_data), stepsize, depth))
         )
+    
     if inmemory:
-        path_data = jnp.concatenate(path_data)
+        path_data = torch.cat(path_data, dim=0)
     else:
-        path_data = np.concatenate(path_data)
+        path_data = np.concatenate(path_data, axis=0)
+    
     return path_data
 
 
-def batch_calc_coeffs(data, include_time, T, inmemory=True):
+def batch_calc_coeffs(data, include_time, T, inmemory=True, device=None):
+    """Calculate coefficients in batches to manage memory."""
+    if device is None:
+        device = data.device if hasattr(data, 'device') else torch.device('cpu')
+    
     N = len(data)
     batchsize = 128
     num_batches = N // batchsize
     remainder = N % batchsize
     coeffs = []
+    
     if inmemory:
         out_func = lambda x: x
         in_func = lambda x: x
     else:
-        out_func = lambda x: np.array(x)
-        in_func = lambda x: jnp.array(x)
+        out_func = lambda x: x.cpu().numpy()
+        in_func = lambda x: torch.from_numpy(x).to(device) if not isinstance(x, torch.Tensor) else x.to(device)
+    
     for i in range(num_batches):
+        batch_data = data[i * batchsize : (i + 1) * batchsize]
         coeffs.append(
-            out_func(
-                calc_coeffs(
-                    in_func(data[i * batchsize : (i + 1) * batchsize]), include_time, T
-                )
-            )
+            out_func(calc_coeffs(in_func(batch_data), include_time, T))
         )
+    
     if remainder > 0:
+        batch_data = data[-remainder:]
         coeffs.append(
-            out_func(calc_coeffs(in_func(data[-remainder:]), include_time, T))
+            out_func(calc_coeffs(in_func(batch_data), include_time, T))
         )
+    
     if inmemory:
-        coeffs = jnp.concatenate(coeffs)
+        coeffs = torch.cat(coeffs, dim=0)
     else:
-        coeffs = np.concatenate(coeffs)
+        coeffs = np.concatenate(coeffs, axis=0)
+    
     return coeffs
 
 
@@ -113,91 +139,80 @@ def dataset_generator(
     inmemory=True,
     idxs=None,
     use_presplit=False,
-    *,
-    key,
+    device=None,
 ):
-    N = len(data)
+    """Generate dataset with different dataloader formats."""
+    if device is None:
+        device = torch.device('cpu')
+    
+    N = len(data) if not use_presplit else len(data[0])
+    
     if idxs is None:
         if use_presplit:
             train_data, val_data, test_data = data
             train_labels, val_labels, test_labels = labels
         else:
-            permkey, key = jr.split(key)
+            # Random permutation for train/val/test split
             bound1 = int(N * 0.7)
             bound2 = int(N * 0.85)
-            idxs_new = jr.permutation(permkey, N)
-            train_data, train_labels = (
-                data[idxs_new[:bound1]],
-                labels[idxs_new[:bound1]],
-            )
-            val_data, val_labels = (
-                data[idxs_new[bound1:bound2]],
-                labels[idxs_new[bound1:bound2]],
-            )
-            test_data, test_labels = data[idxs_new[bound2:]], labels[idxs_new[bound2:]]
+            idxs_new = torch.randperm(N)
+            
+            train_data = data[idxs_new[:bound1]]
+            train_labels = labels[idxs_new[:bound1]]
+            val_data = data[idxs_new[bound1:bound2]]
+            val_labels = labels[idxs_new[bound1:bound2]]
+            test_data = data[idxs_new[bound2:]]
+            test_labels = labels[idxs_new[bound2:]]
     else:
-        train_data, train_labels = data[idxs[0]], labels[idxs[0]]
-        val_data, val_labels = data[idxs[1]], labels[idxs[1]]
-        test_data, test_labels = None, None
+        train_data = data[idxs[0]]
+        train_labels = labels[idxs[0]]
+        val_data = data[idxs[1]]
+        val_labels = labels[idxs[1]]
+        test_data = None
+        test_labels = None
 
-    train_paths = batch_calc_paths(train_data, stepsize, depth)
-    val_paths = batch_calc_paths(val_data, stepsize, depth)
-    test_paths = batch_calc_paths(test_data, stepsize, depth)
-    intervals = jnp.arange(0, train_data.shape[1], stepsize)
-    intervals = jnp.concatenate((intervals, jnp.array([train_data.shape[1]])))
+    # Calculate paths
+    train_paths = batch_calc_paths(train_data, stepsize, depth, inmemory, device)
+    val_paths = batch_calc_paths(val_data, stepsize, depth, inmemory, device)
+    if test_data is not None:
+        test_paths = batch_calc_paths(test_data, stepsize, depth, inmemory, device)
+    else:
+        test_paths = None
+    
+    # Create intervals
+    intervals = torch.arange(0, train_data.shape[1], stepsize, dtype=torch.float32)
+    intervals = torch.cat([intervals, torch.tensor([train_data.shape[1]], dtype=torch.float32)])
     intervals = intervals * (T / train_data.shape[1])
 
+    # Calculate coefficients
     train_coeffs = calc_coeffs(train_data, include_time, T)
     val_coeffs = calc_coeffs(val_data, include_time, T)
-    test_coeffs = calc_coeffs(test_data, include_time, T)
-    train_coeff_data = (
-        (T / train_data.shape[1])
-        * jnp.repeat(
-            jnp.arange(train_data.shape[1])[None, :], train_data.shape[0], axis=0
-        ),
-        train_coeffs,
-        train_data[:, 0, :],
-    )
-    val_coeff_data = (
-        (T / val_data.shape[1])
-        * jnp.repeat(jnp.arange(val_data.shape[1])[None, :], val_data.shape[0], axis=0),
-        val_coeffs,
-        val_data[:, 0, :],
-    )
-    if idxs is None:
-        test_coeff_data = (
-            (T / test_data.shape[1])
-            * jnp.repeat(
-                jnp.arange(test_data.shape[1])[None, :], test_data.shape[0], axis=0
-            ),
-            test_coeffs,
-            test_data[:, 0, :],
-        )
+    if test_data is not None:
+        test_coeffs = calc_coeffs(test_data, include_time, T)
+    
+    # Create coefficient data tuples
+    train_times = (T / train_data.shape[1]) * torch.arange(train_data.shape[1], dtype=torch.float32).unsqueeze(0).expand(train_data.shape[0], -1)
+    val_times = (T / val_data.shape[1]) * torch.arange(val_data.shape[1], dtype=torch.float32).unsqueeze(0).expand(val_data.shape[0], -1)
+    
+    train_coeff_data = (train_times, train_coeffs, train_data[:, 0, :])
+    val_coeff_data = (val_times, val_coeffs, val_data[:, 0, :])
+    
+    if test_data is not None:
+        test_times = (T / test_data.shape[1]) * torch.arange(test_data.shape[1], dtype=torch.float32).unsqueeze(0).expand(test_data.shape[0], -1)
+        test_coeff_data = (test_times, test_coeffs, test_data[:, 0, :])
+    else:
+        test_coeff_data = None
 
-    train_path_data = (
-        (T / train_data.shape[1])
-        * jnp.repeat(
-            jnp.arange(train_data.shape[1])[None, :], train_data.shape[0], axis=0
-        ),
-        train_paths,
-        train_data[:, 0, :],
-    )
-    val_path_data = (
-        (T / val_data.shape[1])
-        * jnp.repeat(jnp.arange(val_data.shape[1])[None, :], val_data.shape[0], axis=0),
-        val_paths,
-        val_data[:, 0, :],
-    )
-    if idxs is None:
-        test_path_data = (
-            (T / test_data.shape[1])
-            * jnp.repeat(
-                jnp.arange(test_data.shape[1])[None, :], test_data.shape[0], axis=0
-            ),
-            test_paths,
-            test_data[:, 0, :],
-        )
+    # Create path data tuples
+    train_path_data = (train_times, train_paths, train_data[:, 0, :])
+    val_path_data = (val_times, val_paths, val_data[:, 0, :])
+    
+    if test_data is not None:
+        test_path_data = (test_times, test_paths, test_data[:, 0, :])
+    else:
+        test_path_data = None
 
+    # Calculate dimensions
     data_dim = train_data.shape[-1]
     if len(train_labels.shape) == 1 or name == "ppg":
         label_dim = 1
@@ -205,22 +220,25 @@ def dataset_generator(
         label_dim = train_labels.shape[-1]
     logsig_dim = train_paths.shape[-1]
 
+    # Create dataloaders
     raw_dataloaders = {
-        "train": Dataloader(train_data, train_labels, inmemory),
-        "val": Dataloader(val_data, val_labels, inmemory),
-        "test": Dataloader(test_data, test_labels, inmemory),
+        "train": Dataloader(train_data, train_labels, inmemory, device),
+        "val": Dataloader(val_data, val_labels, inmemory, device),
+        "test": Dataloader(test_data, test_labels, inmemory, device) if test_data is not None else None,
     }
+    
     coeff_dataloaders = {
-        "train": Dataloader(train_coeff_data, train_labels, inmemory),
-        "val": Dataloader(val_coeff_data, val_labels, inmemory),
-        "test": Dataloader(test_coeff_data, test_labels, inmemory),
+        "train": Dataloader(train_coeff_data, train_labels, inmemory, device),
+        "val": Dataloader(val_coeff_data, val_labels, inmemory, device),
+        "test": Dataloader(test_coeff_data, test_labels, inmemory, device) if test_coeff_data is not None else None,
     }
 
     path_dataloaders = {
-        "train": Dataloader(train_path_data, train_labels, inmemory),
-        "val": Dataloader(val_path_data, val_labels, inmemory),
-        "test": Dataloader(test_path_data, test_labels, inmemory),
+        "train": Dataloader(train_path_data, train_labels, inmemory, device),
+        "val": Dataloader(val_path_data, val_labels, inmemory, device),
+        "test": Dataloader(test_path_data, test_labels, inmemory, device) if test_path_data is not None else None,
     }
+    
     return Dataset(
         name,
         raw_dataloaders,
@@ -242,57 +260,62 @@ def create_uea_dataset(
     depth,
     include_time,
     T,
-    *,
-    key,
+    device=None,
 ):
+    """Create UEA dataset."""
+    if device is None:
+        device = torch.device('cpu')
 
     if use_presplit:
         idxs = None
         with open(data_dir + f"/processed/UEA/{name}/X_train.pkl", "rb") as f:
-            train_data = pickle.load(f)
+            train_data = jax_to_torch(pickle.load(f), device)
         with open(data_dir + f"/processed/UEA/{name}/y_train.pkl", "rb") as f:
-            train_labels = pickle.load(f)
+            train_labels = jax_to_torch(pickle.load(f), device)
         with open(data_dir + f"/processed/UEA/{name}/X_val.pkl", "rb") as f:
-            val_data = pickle.load(f)
+            val_data = jax_to_torch(pickle.load(f), device)
         with open(data_dir + f"/processed/UEA/{name}/y_val.pkl", "rb") as f:
-            val_labels = pickle.load(f)
+            val_labels = jax_to_torch(pickle.load(f), device)
         with open(data_dir + f"/processed/UEA/{name}/X_test.pkl", "rb") as f:
-            test_data = pickle.load(f)
+            test_data = jax_to_torch(pickle.load(f), device)
         with open(data_dir + f"/processed/UEA/{name}/y_test.pkl", "rb") as f:
-            test_labels = pickle.load(f)
+            test_labels = jax_to_torch(pickle.load(f), device)
+            
         if include_time:
-            ts = (T / train_data.shape[1]) * jnp.repeat(
-                jnp.arange(train_data.shape[1])[None, :], train_data.shape[0], axis=0
-            )
-            train_data = jnp.concatenate([ts[:, :, None], train_data], axis=2)
-            ts = (T / val_data.shape[1]) * jnp.repeat(
-                jnp.arange(val_data.shape[1])[None, :], val_data.shape[0], axis=0
-            )
-            val_data = jnp.concatenate([ts[:, :, None], val_data], axis=2)
-            ts = (T / test_data.shape[1]) * jnp.repeat(
-                jnp.arange(test_data.shape[1])[None, :], test_data.shape[0], axis=0
-            )
-            test_data = jnp.concatenate([ts[:, :, None], test_data], axis=2)
+            ts = (T / train_data.shape[1]) * torch.arange(train_data.shape[1], dtype=torch.float32).unsqueeze(0).expand(train_data.shape[0], -1).unsqueeze(-1)
+            train_data = torch.cat([ts, train_data], dim=2)
+            
+            ts = (T / val_data.shape[1]) * torch.arange(val_data.shape[1], dtype=torch.float32).unsqueeze(0).expand(val_data.shape[0], -1).unsqueeze(-1)
+            val_data = torch.cat([ts, val_data], dim=2)
+            
+            ts = (T / test_data.shape[1]) * torch.arange(test_data.shape[1], dtype=torch.float32).unsqueeze(0).expand(test_data.shape[0], -1).unsqueeze(-1)
+            test_data = torch.cat([ts, test_data], dim=2)
+            
         data = (train_data, val_data, test_data)
         onehot_labels = (train_labels, val_labels, test_labels)
     else:
         with open(data_dir + f"/processed/UEA/{name}/data.pkl", "rb") as f:
-            data = pickle.load(f)
+            data = jax_to_torch(pickle.load(f), device)
         with open(data_dir + f"/processed/UEA/{name}/labels.pkl", "rb") as f:
-            labels = pickle.load(f)
-        onehot_labels = jnp.zeros((len(labels), len(jnp.unique(labels))))
-        onehot_labels = onehot_labels.at[jnp.arange(len(labels)), labels].set(1)
+            labels = jax_to_torch(pickle.load(f), device)
+            
+        # Create one-hot labels
+        unique_labels = torch.unique(labels)
+        onehot_labels = torch.zeros((len(labels), len(unique_labels)), device=device)
+        onehot_labels[torch.arange(len(labels)), labels] = 1
+        
         if use_idxs:
             with open(data_dir + f"/processed/UEA/{name}/original_idxs.pkl", "rb") as f:
                 idxs = pickle.load(f)
+                # Convert to torch tensors if needed
+                if isinstance(idxs[0], np.ndarray):
+                    idxs = (torch.from_numpy(idxs[0]).to(device), torch.from_numpy(idxs[1]).to(device))
         else:
             idxs = None
 
         if include_time:
-            ts = (T / data.shape[1]) * jnp.repeat(
-                jnp.arange(data.shape[1])[None, :], data.shape[0], axis=0
-            )
-            data = jnp.concatenate([ts[:, :, None], data], axis=2)
+            ts = (T / data.shape[1]) * torch.arange(data.shape[1], dtype=torch.float32).unsqueeze(0).expand(data.shape[0], -1).unsqueeze(-1)
+            data = torch.cat([ts, data], dim=2)
 
     return dataset_generator(
         name,
@@ -304,74 +327,82 @@ def create_uea_dataset(
         T,
         idxs=idxs,
         use_presplit=use_presplit,
-        key=key,
+        device=device,
     )
 
 
-def create_toy_dataset(data_dir, name, stepsize, depth, include_time, T, *, key):
+def create_toy_dataset(data_dir, name, stepsize, depth, include_time, T, device=None):
+    """Create toy dataset."""
+    if device is None:
+        device = torch.device('cpu')
+        
     with open(data_dir + "/processed/toy/signature/data.pkl", "rb") as f:
-        data = pickle.load(f)
+        data = jax_to_torch(pickle.load(f), device)
     with open(data_dir + "/processed/toy/signature/labels.pkl", "rb") as f:
-        labels = pickle.load(f)
+        labels = jax_to_torch(pickle.load(f), device)
+        
+    # Extract specific signature components based on name
     if name == "signature1":
-        labels = ((jnp.sign(labels[0][:, 2]) + 1) / 2).astype(int)
+        labels = ((torch.sign(labels[0][:, 2]) + 1) / 2).long()
     elif name == "signature2":
-        labels = ((jnp.sign(labels[1][:, 2, 5]) + 1) / 2).astype(int)
+        labels = ((torch.sign(labels[1][:, 2, 5]) + 1) / 2).long()
     elif name == "signature3":
-        labels = ((jnp.sign(labels[2][:, 2, 5, 0]) + 1) / 2).astype(int)
+        labels = ((torch.sign(labels[2][:, 2, 5, 0]) + 1) / 2).long()
     elif name == "signature4":
-        labels = ((jnp.sign(labels[3][:, 2, 5, 0, 3]) + 1) / 2).astype(int)
-    onehot_labels = jnp.zeros((len(labels), len(jnp.unique(labels))))
-    onehot_labels = onehot_labels.at[jnp.arange(len(labels)), labels].set(1)
+        labels = ((torch.sign(labels[3][:, 2, 5, 0, 3]) + 1) / 2).long()
+    
+    # Create one-hot labels
+    unique_labels = torch.unique(labels)
+    onehot_labels = torch.zeros((len(labels), len(unique_labels)), device=device)
+    onehot_labels[torch.arange(len(labels)), labels] = 1
+    
     idxs = None
 
     if include_time:
-        ts = (T / data.shape[1]) * jnp.repeat(
-            jnp.arange(data.shape[1])[None, :], data.shape[0], axis=0
-        )
-        data = jnp.concatenate([ts[:, :, None], data], axis=2)
+        ts = (T / data.shape[1]) * torch.arange(data.shape[1], dtype=torch.float32).unsqueeze(0).expand(data.shape[0], -1).unsqueeze(-1)
+        data = torch.cat([ts, data], dim=2)
 
     return dataset_generator(
-        "toy", data, onehot_labels, stepsize, depth, include_time, T, idxs, key=key
+        "toy", data, onehot_labels, stepsize, depth, include_time, T, idxs, device=device
     )
 
 
 def create_ppg_dataset(
-    data_dir, use_presplit, stepsize, depth, include_time, T, *, key
+    data_dir, use_presplit, stepsize, depth, include_time, T, device=None
 ):
+    """Create PPG dataset."""
+    if device is None:
+        device = torch.device('cpu')
+        
     with open(data_dir + "/processed/PPG/ppg/X_train.pkl", "rb") as f:
-        train_data = pickle.load(f)
+        train_data = jax_to_torch(pickle.load(f), device)
     with open(data_dir + "/processed/PPG/ppg/y_train.pkl", "rb") as f:
-        train_labels = pickle.load(f)
+        train_labels = jax_to_torch(pickle.load(f), device)
     with open(data_dir + "/processed/PPG/ppg/X_val.pkl", "rb") as f:
-        val_data = pickle.load(f)
+        val_data = jax_to_torch(pickle.load(f), device)
     with open(data_dir + "/processed/PPG/ppg/y_val.pkl", "rb") as f:
-        val_labels = pickle.load(f)
+        val_labels = jax_to_torch(pickle.load(f), device)
     with open(data_dir + "/processed/PPG/ppg/X_test.pkl", "rb") as f:
-        test_data = pickle.load(f)
+        test_data = jax_to_torch(pickle.load(f), device)
     with open(data_dir + "/processed/PPG/ppg/y_test.pkl", "rb") as f:
-        test_labels = pickle.load(f)
+        test_labels = jax_to_torch(pickle.load(f), device)
 
     if include_time:
-        ts = (T / train_data.shape[1]) * jnp.repeat(
-            jnp.arange(train_data.shape[1])[None, :], train_data.shape[0], axis=0
-        )
-        train_data = jnp.concatenate([ts[:, :, None], train_data], axis=2)
-        ts = (T / val_data.shape[1]) * jnp.repeat(
-            jnp.arange(val_data.shape[1])[None, :], val_data.shape[0], axis=0
-        )
-        val_data = jnp.concatenate([ts[:, :, None], val_data], axis=2)
-        ts = (T / test_data.shape[1]) * jnp.repeat(
-            jnp.arange(test_data.shape[1])[None, :], test_data.shape[0], axis=0
-        )
-        test_data = jnp.concatenate([ts[:, :, None], test_data], axis=2)
+        ts = (T / train_data.shape[1]) * torch.arange(train_data.shape[1], dtype=torch.float32).unsqueeze(0).expand(train_data.shape[0], -1).unsqueeze(-1)
+        train_data = torch.cat([ts, train_data], dim=2)
+        
+        ts = (T / val_data.shape[1]) * torch.arange(val_data.shape[1], dtype=torch.float32).unsqueeze(0).expand(val_data.shape[0], -1).unsqueeze(-1)
+        val_data = torch.cat([ts, val_data], dim=2)
+        
+        ts = (T / test_data.shape[1]) * torch.arange(test_data.shape[1], dtype=torch.float32).unsqueeze(0).expand(test_data.shape[0], -1).unsqueeze(-1)
+        test_data = torch.cat([ts, test_data], dim=2)
 
     if use_presplit:
         data = (train_data, val_data, test_data)
         labels = (train_labels, val_labels, test_labels)
     else:
-        data = jnp.concatenate((train_data, val_data, test_data), axis=0)
-        labels = jnp.concatenate((train_labels, val_labels, test_labels), axis=0)
+        data = torch.cat((train_data, val_data, test_data), dim=0)
+        labels = torch.cat((train_labels, val_labels, test_labels), dim=0)
 
     return dataset_generator(
         "ppg",
@@ -383,7 +414,7 @@ def create_ppg_dataset(
         T,
         inmemory=False,
         use_presplit=use_presplit,
-        key=key,
+        device=device,
     )
 
 
@@ -396,9 +427,12 @@ def create_dataset(
     depth,
     include_time,
     T,
-    *,
-    key,
+    device=None,
 ):
+    """Create dataset based on name and parameters."""
+    if device is None:
+        device = torch.device('cpu')
+        
     uea_subfolders = [
         f.name for f in os.scandir(data_dir + "/processed/UEA") if f.is_dir()
     ]
@@ -416,15 +450,15 @@ def create_dataset(
             depth,
             include_time,
             T,
-            key=key,
+            device=device,
         )
     elif name[:-1] in toy_subfolders:
         return create_toy_dataset(
-            data_dir, name, stepsize, depth, include_time, T, key=key
+            data_dir, name, stepsize, depth, include_time, T, device=device
         )
     elif name == "ppg":
         return create_ppg_dataset(
-            data_dir, use_presplit, stepsize, depth, include_time, T, key=key
+            data_dir, use_presplit, stepsize, depth, include_time, T, device=device
         )
     else:
         raise ValueError(f"Dataset {name} not found in UEA folder and not toy dataset")

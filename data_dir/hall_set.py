@@ -8,7 +8,7 @@ import itertools
 from collections import defaultdict
 from typing import Generator, Union
 
-import jax.numpy as jnp
+import torch
 import numpy as np
 from scipy.sparse import csc_matrix
 
@@ -207,7 +207,7 @@ class HallSet:
             for k, c in self.product(first, k1)
         ]
 
-    def l2t_matrix(self, degree=None, dtype=np.float32) -> jnp.ndarray:
+    def l2t_matrix(self, degree=None, dtype=np.float32) -> torch.Tensor:
         degree = degree or self.degree
         tensor_alg_size = tensor_algebra_dimension(self.width, degree)
 
@@ -223,15 +223,16 @@ class HallSet:
         data = np.array(data, dtype=dtype)
         indices = np.array(indices, dtype=np.int64)
         indptr = np.array(indptr, dtype=np.int64)
-        return jnp.array(
-            csc_matrix(
-                (data, indices, indptr),
-                shape=(tensor_alg_size, self.sizes[degree]),
-                dtype=dtype,
-            ).toarray()
+        
+        sparse_matrix = csc_matrix(
+            (data, indices, indptr),
+            shape=(tensor_alg_size, self.sizes[degree]),
+            dtype=dtype,
         )
+        
+        return torch.from_numpy(sparse_matrix.toarray())
 
-    def t2l_matrix(self, degree=None, dtype=np.float32) -> jnp.ndarray:
+    def t2l_matrix(self, degree=None, dtype=np.float32) -> torch.Tensor:
         degree = degree or self.degree
         tensor_alg_size = tensor_algebra_dimension(self.width, degree)
 
@@ -247,10 +248,10 @@ class HallSet:
         indices = np.array(indices, dtype=np.int64)
         indptr = np.array(indptr, dtype=np.int64)
 
-        return jnp.array(
-            csc_matrix(
-                (data, indices, indptr),
-                shape=(self.sizes[degree], tensor_alg_size),
-                dtype=dtype,
-            ).toarray()
+        sparse_matrix = csc_matrix(
+            (data, indices, indptr),
+            shape=(self.sizes[degree], tensor_alg_size),
+            dtype=dtype,
         )
+        
+        return torch.from_numpy(sparse_matrix.toarray())
