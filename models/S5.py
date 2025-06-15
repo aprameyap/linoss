@@ -1,7 +1,7 @@
 """
 S5 implementation modified from: https://github.com/lindermanlab/S5/blob/main/s5/ssm_init.py
 
-This module implements S5 using JAX and Equinox.
+This module implements S5 using PyTorch.
 
 Attributes of the S5 model:
 - `linear_encoder`: The linear encoder applied to the input time series.
@@ -19,15 +19,23 @@ The module also includes:
 """
 
 from typing import List
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import math
+from scipy.linalg import block_diag as scipy_block_diag
 
-import equinox as eqx
-import jax
-import jax.numpy as jnp
-import jax.random as jr
-from jax.nn.initializers import lecun_normal, normal
-from jax.scipy.linalg import block_diag
 
-from models.LRU import GLU
+class GLU(nn.Module):
+    """Gated Linear Unit"""
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.w1 = nn.Linear(input_dim, output_dim, bias=True)
+        self.w2 = nn.Linear(input_dim, output_dim, bias=True)
+
+    def forward(self, x):
+        return self.w1(x) * torch.sigmoid(self.w2(x))
 
 
 def make_HiPPO(N):
@@ -38,9 +46,9 @@ def make_HiPPO(N):
     Returns:
         N x N HiPPO LegS matrix
     """
-    P = jnp.sqrt(1 + 2 * jnp.arange(N))
-    A = P[:, jnp.newaxis] * P[jnp.newaxis, :]
-    A = jnp.tril(A) - jnp.diag(jnp.arange(N))
+    P = np.sqrt(1 + 2 * np.arange(N))
+    A = P[:, np.newaxis] * P[np.newaxis, :]
+    A = np.tril(A) - np.diag(np.arange(N))
     return -A
 
 
@@ -59,10 +67,10 @@ def make_NPLR_HiPPO(N):
     hippo = make_HiPPO(N)
 
     # Add in a rank 1 term. Makes it Normal.
-    P = jnp.sqrt(jnp.arange(N) + 0.5)
+    P = np.sqrt(np.arange(N) + 0.5)
 
     # HiPPO also specifies the B matrix
-    B = jnp.sqrt(2 * jnp.arange(N) + 1.0)
+    B = np.sqrt(2 * np.arange(N) + 1.0)
     return hippo, P, B
 
 
@@ -81,13 +89,13 @@ def make_DPLR_HiPPO(N):
     """
     A, P, B = make_NPLR_HiPPO(N)
 
-    S = A + P[:, jnp.newaxis] * P[jnp.newaxis, :]
+    S = A + P[:, np.newaxis] * P[np.newaxis, :]
 
-    S_diag = jnp.diagonal(S)
-    Lambda_real = jnp.mean(S_diag) * jnp.ones_like(S_diag)
+    S_diag = np.diagonal(S)
+    Lambda_real = np.mean(S_diag) * np.ones_like(S_diag)
 
     # Diagonalize S to V \Lambda V^*
-    Lambda_imag, V = jnp.linalg.eigh(S * -1j)
+    Lambda_imag, V = np.linalg.eigh(S * -1j)
 
     P = V.conj().T @ P
     B_orig = B
@@ -104,95 +112,96 @@ def log_step_initializer(dt_min=0.001, dt_max=0.1):
     Returns:
         init function
     """
-
-    def init(key, shape):
+    def init(shape):
         """Init function
         Args:
-            key: jax jr key
             shape tuple: desired shape
         Returns:
             sampled log_step (float32)
         """
-        return jr.uniform(key, shape) * (jnp.log(dt_max) - jnp.log(dt_min)) + jnp.log(
-            dt_min
-        )
-
+        return torch.rand(shape) * (np.log(dt_max) - np.log(dt_min)) + np.log(dt_min)
+    
     return init
 
 
-def init_log_steps(key, input):
+def init_log_steps(H, dt_min, dt_max):
     """Initialize an array of learnable timescale parameters
     Args:
-        key: jax jr key
-        input: tuple containing the array shape H and
-               dt_min and dt_max
+        H: array length
+        dt_min, dt_max: time scale bounds
     Returns:
         initialized array of timescales (float32): (H,)
     """
-    H, dt_min, dt_max = input
     log_steps = []
+    init_fn = log_step_initializer(dt_min=dt_min, dt_max=dt_max)
     for i in range(H):
-        key, skey = jr.split(key)
-        log_step = log_step_initializer(dt_min=dt_min, dt_max=dt_max)(skey, shape=(1,))
+        log_step = init_fn((1,))
         log_steps.append(log_step)
+    return torch.cat(log_steps)
 
-    return jnp.array(log_steps)
 
-
-def init_VinvB(init_fun, rng, shape, Vinv):
+def init_VinvB(shape, Vinv):
     """Initialize B_tilde=V^{-1}B. First samples B. Then compute V^{-1}B.
     Note we will parameterize this with two different matrices for complex
     numbers.
      Args:
-         init_fun:  the initialization function to use, e.g. lecun_normal()
-         rng:       jax jr key to be used with init function.
          shape (tuple): desired shape  (P,H)
          Vinv: (complex64)     the inverse eigenvectors used for initialization
      Returns:
          B_tilde (complex64) of shape (P,H,2)
     """
-    B = init_fun(rng, shape)
-    VinvB = Vinv @ B
+    # Lecun normal initialization
+    fan_in = shape[0]
+    std = 1.0 / math.sqrt(fan_in)
+    B = torch.randn(shape) * std
+    
+    # Convert to torch and compute V^{-1}B
+    Vinv_torch = torch.from_numpy(Vinv).cfloat()
+    VinvB = torch.matmul(Vinv_torch, B.cfloat())
+    
+    # Stack real and imaginary parts
     VinvB_real = VinvB.real
     VinvB_imag = VinvB.imag
-    return jnp.concatenate((VinvB_real[..., None], VinvB_imag[..., None]), axis=-1)
+    return torch.stack([VinvB_real, VinvB_imag], dim=-1)
 
 
-def trunc_standard_normal(key, shape):
+def trunc_standard_normal(shape):
     """Sample C with a truncated normal distribution with standard deviation 1.
     Args:
-        key: jax jr key
         shape (tuple): desired shape, of length 3, (H,P,_)
     Returns:
         sampled C matrix (float32) of shape (H,P,2) (for complex parameterization)
     """
     H, P, _ = shape
-    Cs = []
-    for i in range(H):
-        key, skey = jr.split(key)
-        C = lecun_normal()(skey, shape=(1, P, 2))
-        Cs.append(C)
-    return jnp.array(Cs)[:, 0]
+    # Lecun normal for each H
+    fan_in = P
+    std = 1.0 / math.sqrt(fan_in)
+    return torch.randn(H, P, 2) * std
 
 
-def init_CV(init_fun, rng, shape, V):
+def init_CV(shape, V):
     """Initialize C_tilde=CV. First sample C. Then compute CV.
     Note we will parameterize this with two different matrices for complex
     numbers.
      Args:
-         init_fun:  the initialization function to use, e.g. lecun_normal()
-         rng:       jax jr key to be used with init function.
          shape (tuple): desired shape  (H,P)
          V: (complex64)     the eigenvectors used for initialization
      Returns:
          C_tilde (complex64) of shape (H,P,2)
     """
-    C_ = init_fun(rng, shape)
-    C = C_[..., 0] + 1j * C_[..., 1]
-    CV = C @ V
+    H, P = shape
+    # Lecun normal initialization
+    fan_in = P
+    std = 1.0 / math.sqrt(fan_in)
+    C_ = torch.randn(H, P, 2) * std
+    
+    C_complex = torch.complex(C_[..., 0], C_[..., 1])
+    V_torch = torch.from_numpy(V).cfloat()
+    CV = torch.matmul(C_complex, V_torch)
+    
     CV_real = CV.real
     CV_imag = CV.imag
-    return jnp.concatenate((CV_real[..., None], CV_imag[..., None]), axis=-1)
+    return torch.stack([CV_real, CV_imag], dim=-1)
 
 
 # Discretization functions
@@ -206,11 +215,11 @@ def discretize_bilinear(Lambda, B_tilde, Delta):
     Returns:
         discretized Lambda_bar (complex64), B_bar (complex64)  (P,), (P,H)
     """
-    Identity = jnp.ones(Lambda.shape[0])
-
+    Identity = torch.ones_like(Lambda)
+    
     BL = 1 / (Identity - (Delta / 2.0) * Lambda)
     Lambda_bar = BL * (Identity + (Delta / 2.0) * Lambda)
-    B_bar = (BL * Delta)[..., None] * B_tilde
+    B_bar = (BL * Delta).unsqueeze(-1) * B_tilde
     return Lambda_bar, B_bar
 
 
@@ -224,15 +233,14 @@ def discretize_zoh(Lambda, B_tilde, Delta):
     Returns:
         discretized Lambda_bar (complex64), B_bar (complex64)  (P,), (P,H)
     """
-    Identity = jnp.ones(Lambda.shape[0])
-    Lambda_bar = jnp.exp(Lambda * Delta)
-    B_bar = (1 / Lambda * (Lambda_bar - Identity))[..., None] * B_tilde
+    Identity = torch.ones_like(Lambda)
+    Lambda_bar = torch.exp(Lambda * Delta)
+    B_bar = (1 / Lambda * (Lambda_bar - Identity)).unsqueeze(-1) * B_tilde
     return Lambda_bar, B_bar
 
 
 # Parallel scan operations
-@jax.vmap
-def binary_operator(q_i, q_j):
+def binary_operator_single(q_i, q_j):
     """Binary operator for parallel scan of linear recurrence. Assumes a diagonal matrix A.
     Args:
         q_i: tuple containing A_i and Bu_i at position i       (P,), (P,)
@@ -243,6 +251,31 @@ def binary_operator(q_i, q_j):
     A_i, b_i = q_i
     A_j, b_j = q_j
     return A_j * A_i, A_j * b_i + b_j
+
+
+def associative_scan(binary_op, elements):
+    """
+    PyTorch implementation of associative scan.
+    Sequential implementation - can be parallelized for better performance.
+    """
+    Lambda_elements, Bu_elements = elements
+    length = Lambda_elements.shape[0]
+    
+    # Initialize outputs
+    outputs_Lambda = torch.zeros_like(Lambda_elements)
+    outputs_Bu = torch.zeros_like(Bu_elements)
+    
+    # Sequential scan
+    outputs_Lambda[0] = Lambda_elements[0]
+    outputs_Bu[0] = Bu_elements[0]
+    
+    for i in range(1, length):
+        outputs_Lambda[i], outputs_Bu[i] = binary_op(
+            (outputs_Lambda[i-1], outputs_Bu[i-1]),
+            (Lambda_elements[i], Bu_elements[i])
+        )
+    
+    return outputs_Lambda, outputs_Bu
 
 
 def apply_ssm(Lambda_bar, B_bar, C_tilde, input_sequence, conj_sym):
@@ -256,34 +289,25 @@ def apply_ssm(Lambda_bar, B_bar, C_tilde, input_sequence, conj_sym):
     Returns:
         ys (float32): the SSM outputs (S5 layer preactivations)      (L, H)
     """
-    Lambda_elements = Lambda_bar * jnp.ones(
-        (input_sequence.shape[0], Lambda_bar.shape[0])
-    )
-    Bu_elements = jax.vmap(lambda u: B_bar @ u)(input_sequence)
-
-    _, xs = jax.lax.associative_scan(binary_operator, (Lambda_elements, Bu_elements))
-
+    L = input_sequence.shape[0]
+    Lambda_elements = Lambda_bar.unsqueeze(0).expand(L, -1)
+    
+    # Bu_elements: B_bar @ u for each time step
+    Bu_elements = torch.matmul(input_sequence, B_bar.T)  # (L, P)
+    
+    # Associative scan
+    _, xs = associative_scan(binary_operator_single, (Lambda_elements, Bu_elements))
+    
+    # Apply output matrix C
+    outputs = torch.matmul(xs, C_tilde.T)  # (L, H)
+    
     if conj_sym:
-        return jax.vmap(lambda x: 2 * (C_tilde @ x).real)(xs)
+        return 2 * outputs.real
     else:
-        return jax.vmap(lambda x: (C_tilde @ x).real)(xs)
+        return outputs.real
 
 
-class S5Layer(eqx.Module):
-    Lambda_re: jax.Array
-    Lambda_im: jax.Array
-    B: jax.Array
-    C: jax.Array
-    D: jax.Array
-    log_step: jax.Array
-
-    H: int
-    P: int
-    conj_sym: bool
-    clip_eigs: bool = False
-    discretisation: str
-    step_rescale: float = 1.0
-
+class S5Layer(nn.Module):
     def __init__(
         self,
         ssm_size,
@@ -296,12 +320,9 @@ class S5Layer(eqx.Module):
         dt_min,
         dt_max,
         step_rescale,
-        *,
-        key
     ):
-
-        B_key, C_key, D_key, step_key, key = jr.split(key, 5)
-
+        super().__init__()
+        
         block_size = int(ssm_size / blocks)
         # Initialize state matrix A using approximation to HiPPO-LegS matrix
         Lambda, _, B, V, B_orig = make_DPLR_HiPPO(block_size)
@@ -318,9 +339,9 @@ class S5Layer(eqx.Module):
 
         # If initializing state matrix A as block-diagonal, put HiPPO approximation
         # on each block
-        Lambda = (Lambda * jnp.ones((blocks, block_size))).ravel()
-        V = block_diag(*([V] * blocks))
-        Vinv = block_diag(*([Vc] * blocks))
+        Lambda = np.tile(Lambda, blocks)
+        V = scipy_block_diag(*([V] * blocks))
+        Vinv = scipy_block_diag(*([Vc] * blocks))
 
         self.H = H
         self.P = P
@@ -329,53 +350,55 @@ class S5Layer(eqx.Module):
         else:
             local_P = P
 
-        self.Lambda_re = Lambda.real
-        self.Lambda_im = Lambda.imag
+        # Store Lambda as real and imaginary parts
+        self.register_parameter('Lambda_re', nn.Parameter(torch.from_numpy(Lambda.real).float()))
+        self.register_parameter('Lambda_im', nn.Parameter(torch.from_numpy(Lambda.imag).float()))
 
         self.conj_sym = conj_sym
-
         self.clip_eigs = clip_eigs
 
-        self.B = init_VinvB(lecun_normal(), B_key, (local_P, self.H), Vinv)
+        # Initialize B matrix
+        B_init = init_VinvB((local_P, self.H), Vinv)
+        self.register_parameter('B', nn.Parameter(B_init))
 
         # Initialize state to output (C) matrix
-        if C_init in ["trunc_standard_normal"]:
-            C_init = trunc_standard_normal
-        elif C_init in ["lecun_normal"]:
-            C_init = lecun_normal()
-        elif C_init in ["complex_normal"]:
-            C_init = normal(stddev=0.5**0.5)
+        if C_init == "trunc_standard_normal":
+            C_init_tensor = trunc_standard_normal((self.H, local_P, 2))
+        elif C_init == "lecun_normal":
+            C_init_tensor = init_CV((self.H, local_P), V)
+        elif C_init == "complex_normal":
+            std = 0.5**0.5
+            C_init_tensor = torch.randn(self.H, 2 * self.P, 2) * std
         else:
             raise NotImplementedError("C_init method {} not implemented".format(C_init))
 
-        if C_init in ["complex_normal"]:
-            self.C = C_init(C_key, (self.H, 2 * self.P, 2))
-        else:
-            self.C = init_CV(C_init, C_key, (self.H, local_P, 2), V)
+        self.register_parameter('C', nn.Parameter(C_init_tensor))
 
-        self.D = normal(stddev=1.0)(D_key, (self.H,))
+        # Initialize D matrix
+        self.register_parameter('D', nn.Parameter(torch.randn(self.H)))
 
         # Initialize learnable discretisation timescale value
-        self.log_step = init_log_steps(step_key, (self.P, dt_min, dt_max))
+        log_step_init = init_log_steps(self.P, dt_min, dt_max)
+        self.register_parameter('log_step', nn.Parameter(log_step_init.unsqueeze(-1)))
 
         self.step_rescale = step_rescale
         self.discretisation = discretisation
 
-    def __call__(self, input_sequence):
+    def forward(self, input_sequence):
         if self.clip_eigs:
-            Lambda = jnp.clip(self.Lambda_re, None, -1e-4) + 1j * self.Lambda_im
+            Lambda = torch.clamp(self.Lambda_re, max=-1e-4) + 1j * self.Lambda_im
         else:
-            Lambda = self.Lambda_re + 1j * self.Lambda_im
+            Lambda = torch.complex(self.Lambda_re, self.Lambda_im)
 
-        B_tilde = self.B[..., 0] + 1j * self.B[..., 1]
-        C_tilde = self.C[..., 0] + 1j * self.C[..., 1]
+        B_tilde = torch.complex(self.B[..., 0], self.B[..., 1])
+        C_tilde = torch.complex(self.C[..., 0], self.C[..., 1])
 
-        step = self.step_rescale * jnp.exp(self.log_step[:, 0])
+        step = self.step_rescale * torch.exp(self.log_step[:, 0])
 
         # Discretize
-        if self.discretisation in ["zoh"]:
+        if self.discretisation == "zoh":
             Lambda_bar, B_bar = discretize_zoh(Lambda, B_tilde, step)
-        elif self.discretisation in ["bilinear"]:
+        elif self.discretisation == "bilinear":
             Lambda_bar, B_bar = discretize_bilinear(Lambda, B_tilde, step)
         else:
             raise NotImplementedError(
@@ -384,18 +407,12 @@ class S5Layer(eqx.Module):
 
         ys = apply_ssm(Lambda_bar, B_bar, C_tilde, input_sequence, self.conj_sym)
 
-        # Add feedthrough matrix output Du;
-        Du = jax.vmap(lambda u: self.D * u)(input_sequence)
+        # Add feedthrough matrix output Du
+        Du = input_sequence * self.D.unsqueeze(0)
         return ys + Du
 
 
-class S5Block(eqx.Module):
-
-    norm: eqx.nn.BatchNorm
-    ssm: S5Layer
-    glu: GLU
-    drop: eqx.nn.Dropout
-
+class S5Block(nn.Module):
     def __init__(
         self,
         ssm_size,
@@ -409,13 +426,11 @@ class S5Block(eqx.Module):
         dt_max,
         step_rescale,
         drop_rate=0.05,
-        *,
-        key
     ):
-        ssmkey, glukey = jr.split(key, 2)
-        self.norm = eqx.nn.BatchNorm(
-            input_size=H, axis_name="batch", channelwise_affine=False
-        )
+        super().__init__()
+        
+        # Use LayerNorm instead of BatchNorm for sequence data
+        self.norm = nn.LayerNorm(H, elementwise_affine=False)
         self.ssm = S5Layer(
             ssm_size,
             blocks,
@@ -427,35 +442,23 @@ class S5Block(eqx.Module):
             dt_min,
             dt_max,
             step_rescale,
-            key=ssmkey,
         )
-        self.glu = GLU(H, H, key=glukey)
-        self.drop = eqx.nn.Dropout(p=drop_rate)
+        self.glu = GLU(H, H)
+        self.dropout = nn.Dropout(p=drop_rate)
 
-    def __call__(self, x, state, *, key):
+    def forward(self, x):
         """Compute S5 block."""
-        dropkey1, dropkey2 = jr.split(key, 2)
         skip = x
-        x, state = self.norm(x.T, state)
-        x = x.T
+        x = self.norm(x)
         x = self.ssm(x)
-        x = self.drop(jax.nn.gelu(x), key=dropkey1)
-        x = jax.vmap(self.glu)(x)
-        x = self.drop(x, key=dropkey2)
+        x = self.dropout(F.gelu(x))
+        x = self.glu(x)
+        x = self.dropout(x)
         x = skip + x
-        return x, state
+        return x
 
 
-class S5(eqx.Module):
-    linear_encoder: eqx.nn.Linear
-    blocks: List[S5Block]
-    linear_layer: eqx.nn.Linear
-    classification: bool
-    output_step: int
-    stateful: bool = True
-    nondeterministic: bool = True
-    lip2: bool = False
-
+class S5(nn.Module):
     def __init__(
         self,
         num_blocks,
@@ -473,15 +476,11 @@ class S5(eqx.Module):
         dt_min,
         dt_max,
         step_rescale,
-        *,
-        key
     ):
-
-        linear_encoder_key, *block_keys, linear_layer_key, weightkey = jr.split(
-            key, num_blocks + 3
-        )
-        self.linear_encoder = eqx.nn.Linear(N, H, key=linear_encoder_key)
-        self.blocks = [
+        super().__init__()
+        
+        self.linear_encoder = nn.Linear(N, H)
+        self.blocks = nn.ModuleList([
             S5Block(
                 ssm_size,
                 ssm_blocks,
@@ -493,24 +492,29 @@ class S5(eqx.Module):
                 dt_min,
                 dt_max,
                 step_rescale,
-                key=key,
             )
-            for key in block_keys
-        ]
-        self.linear_layer = eqx.nn.Linear(H, output_dim, key=linear_layer_key)
+            for _ in range(num_blocks)
+        ])
+        self.linear_layer = nn.Linear(H, output_dim)
         self.classification = classification
         self.output_step = output_step
+        
+        # Stateful attributes to match original interface
+        self.stateful = True
+        self.nondeterministic = True
+        self.lip2 = False
 
-    def __call__(self, x, state, key):
+    def forward(self, x):
         """Compute S5."""
-        dropkeys = jr.split(key, len(self.blocks))
-        x = jax.vmap(self.linear_encoder)(x)
-        for block, key in zip(self.blocks, dropkeys):
-            x, state = block(x, state, key=key)
+        x = self.linear_encoder(x)
+        for block in self.blocks:
+            x = block(x)
+        
         if self.classification:
-            x = jnp.mean(x, axis=0)
-            x = jax.nn.softmax(self.linear_layer(x), axis=0)
+            x = torch.mean(x, dim=0)
+            x = F.softmax(self.linear_layer(x), dim=0)
         else:
-            x = x[self.output_step - 1 :: self.output_step]
-            x = jax.nn.tanh(jax.vmap(self.linear_layer)(x))
-        return x, state
+            x = x[self.output_step - 1::self.output_step]
+            x = torch.tanh(self.linear_layer(x))
+        
+        return x

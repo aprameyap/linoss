@@ -1,7 +1,7 @@
 """
 Code modified from https://gist.github.com/Ryu1845/7e78da4baa8925b4de482969befa949d
 
-This module implements the `LRU` class, a model architecture using JAX and Equinox.
+This module implements the `LRU` class, a model architecture using PyTorch.
 
 Attributes of the `LRU` class:
 - `linear_encoder`: The linear encoder applied to the input time series data.
@@ -20,124 +20,179 @@ The module also includes the following classes and functions:
 """
 
 from typing import List
-
-import equinox as eqx
-import jax
-import jax.numpy as jnp
-import jax.random as jr
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
 
 
 def binary_operator_diag(element_i, element_j):
+    """Binary operator for diagonal associative scan in LRU layer."""
     a_i, bu_i = element_i
     a_j, bu_j = element_j
     return a_j * a_i, a_j * bu_i + bu_j
 
 
-class GLU(eqx.Module):
-    w1: eqx.nn.Linear
-    w2: eqx.nn.Linear
-
-    def __init__(self, input_dim, output_dim, key):
-        w1_key, w2_key = jr.split(key, 2)
-        self.w1 = eqx.nn.Linear(input_dim, output_dim, use_bias=True, key=w1_key)
-        self.w2 = eqx.nn.Linear(input_dim, output_dim, use_bias=True, key=w2_key)
-
-    def __call__(self, x):
-        return self.w1(x) * jax.nn.sigmoid(self.w2(x))
-
-
-class LRULayer(eqx.Module):
-    nu_log: jnp.ndarray
-    theta_log: jnp.ndarray
-    B_re: jnp.ndarray
-    B_im: jnp.ndarray
-    C_re: jnp.ndarray
-    C_im: jnp.ndarray
-    D: jnp.ndarray
-    gamma_log: jnp.ndarray
-
-    def __init__(self, N, H, r_min=0, r_max=1, max_phase=6.28, *, key):
-        u1_key, u2_key, B_re_key, B_im_key, C_re_key, C_im_key, D_key = jr.split(key, 7)
-
-        # N: state dimension, H: model dimension
-        # Initialization of Lambda is complex valued distributed uniformly on ring
-        # between r_min and r_max, with phase in [0, max_phase].
-        u1 = jr.uniform(u1_key, shape=(N,))
-        u2 = jr.uniform(u2_key, shape=(N,))
-        self.nu_log = jnp.log(
-            -0.5 * jnp.log(u1 * (r_max**2 - r_min**2) + r_min**2)
+def associative_scan_diag(binary_op, elements):
+    """
+    PyTorch implementation of associative scan for diagonal elements.
+    Sequential implementation - can be parallelized for better performance.
+    """
+    Lambda_elements, Bu_elements = elements
+    length = Lambda_elements.shape[0]
+    
+    # Initialize outputs
+    outputs_a = torch.zeros_like(Lambda_elements)
+    outputs_bu = torch.zeros_like(Bu_elements)
+    
+    # Sequential scan
+    outputs_a[0] = Lambda_elements[0]
+    outputs_bu[0] = Bu_elements[0]
+    
+    for i in range(1, length):
+        outputs_a[i], outputs_bu[i] = binary_op(
+            (outputs_a[i-1], outputs_bu[i-1]),
+            (Lambda_elements[i], Bu_elements[i])
         )
-        self.theta_log = jnp.log(max_phase * u2)
+    
+    return outputs_a, outputs_bu
 
-        # Glorot initialized Input/Output projection matrices
-        self.B_re = jr.normal(B_re_key, shape=(N, H)) / jnp.sqrt(2 * H)
-        self.B_im = jr.normal(B_im_key, shape=(N, H)) / jnp.sqrt(2 * H)
-        self.C_re = jr.normal(C_re_key, shape=(H, N)) / jnp.sqrt(N)
-        self.C_im = jr.normal(C_im_key, shape=(H, N)) / jnp.sqrt(N)
-        self.D = jr.normal(D_key, shape=(H,))
 
-        # Normalization factor
-        diag_lambda = jnp.exp(-jnp.exp(self.nu_log) + 1j * jnp.exp(self.theta_log))
-        self.gamma_log = jnp.log(jnp.sqrt(1 - jnp.abs(diag_lambda) ** 2))
+class GLU(nn.Module):
+    """Gated Linear Unit"""
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.w1 = nn.Linear(input_dim, output_dim, bias=True)
+        self.w2 = nn.Linear(input_dim, output_dim, bias=True)
 
-    def __call__(self, x):
-        # Materializing the diagonal of Lambda and projections
-        Lambda = jnp.exp(-jnp.exp(self.nu_log) + 1j * jnp.exp(self.theta_log))
-        B_norm = (self.B_re + 1j * self.B_im) * jnp.expand_dims(
-            jnp.exp(self.gamma_log), axis=-1
-        )
-        C = self.C_re + 1j * self.C_im
-        # Running the LRU + output projection
-        Lambda_elements = jnp.repeat(Lambda[None, ...], x.shape[0], axis=0)
-        Bu_elements = jax.vmap(lambda u: B_norm @ u)(x)
+    def forward(self, x):
+        return self.w1(x) * torch.sigmoid(self.w2(x))
+
+
+class LRULayer(nn.Module):
+    def __init__(self, N, H, r_min=0, r_max=1, max_phase=6.28):
+        super().__init__()
+        
+        self.N = N  # state dimension
+        self.H = H  # model dimension
+        
+        # Initialize Lambda parameters (complex diagonal matrix)
+        # Lambda is distributed uniformly on ring between r_min and r_max
+        u1 = torch.rand(N)
+        u2 = torch.rand(N)
+        
+        # Log-parameterized radial component
+        nu_log_init = torch.log(-0.5 * torch.log(u1 * (r_max**2 - r_min**2) + r_min**2))
+        self.register_parameter('nu_log', nn.Parameter(nu_log_init))
+        
+        # Log-parameterized phase component  
+        theta_log_init = torch.log(max_phase * u2)
+        self.register_parameter('theta_log', nn.Parameter(theta_log_init))
+        
+        # Glorot initialized Input/Output projection matrices (complex)
+        # B matrix (input projection)
+        B_re_init = torch.randn(N, H) / math.sqrt(2 * H)
+        B_im_init = torch.randn(N, H) / math.sqrt(2 * H)
+        self.register_parameter('B_re', nn.Parameter(B_re_init))
+        self.register_parameter('B_im', nn.Parameter(B_im_init))
+        
+        # C matrix (output projection)
+        C_re_init = torch.randn(H, N) / math.sqrt(N)
+        C_im_init = torch.randn(H, N) / math.sqrt(N)
+        self.register_parameter('C_re', nn.Parameter(C_re_init))
+        self.register_parameter('C_im', nn.Parameter(C_im_init))
+        
+        # D matrix (skip connection)
+        D_init = torch.randn(H)
+        self.register_parameter('D', nn.Parameter(D_init))
+        
+        # Compute and store normalization factor
+        diag_lambda = torch.exp(-torch.exp(self.nu_log) + 1j * torch.exp(self.theta_log))
+        gamma_log_init = torch.log(torch.sqrt(1 - torch.abs(diag_lambda) ** 2))
+        self.register_parameter('gamma_log', nn.Parameter(gamma_log_init))
+
+    def forward(self, x):
+        """
+        Forward pass of LRU layer.
+        
+        Args:
+            x: Input tensor of shape (L, H) where L is sequence length
+            
+        Returns:
+            Output tensor of shape (L, H)
+        """
+        # Materialize the diagonal of Lambda and projections
+        Lambda = torch.exp(-torch.exp(self.nu_log) + 1j * torch.exp(self.theta_log))
+        
+        # Normalized input projection matrix
+        B_complex = torch.complex(self.B_re, self.B_im)
+        gamma = torch.exp(self.gamma_log)
+        B_norm = B_complex * gamma.unsqueeze(-1)
+        
+        # Output projection matrix
+        C = torch.complex(self.C_re, self.C_im)
+        
+        # Running the LRU computation
+        # Lambda_elements: repeat Lambda for each time step
+        Lambda_elements = Lambda.unsqueeze(0).expand(x.shape[0], -1)  # (L, N)
+        
+        # Bu_elements: apply input projection to each time step
+        Bu_elements = torch.matmul(x, B_norm.T)  # (L, N)
+        
+        # Associative scan to compute all hidden states
         elements = (Lambda_elements, Bu_elements)
-        _, inner_states = jax.lax.associative_scan(
-            binary_operator_diag, elements
-        )  # all x_k
-        y = jax.vmap(lambda z, u: (C @ z).real + (self.D * u))(inner_states, x)
-
+        _, inner_states = associative_scan_diag(binary_operator_diag, elements)
+        
+        # Output projection: y = Re(C @ z) + D * u
+        # Apply C to each hidden state and take real part
+        Cz = torch.matmul(inner_states, C.T)  # (L, H)
+        y = Cz.real + self.D.unsqueeze(0) * x  # (L, H)
+        
         return y
 
 
-class LRUBlock(eqx.Module):
+class LRUBlock(nn.Module):
+    def __init__(self, N, H, r_min=0, r_max=1, max_phase=6.28, drop_rate=0.1):
+        super().__init__()
+        
+        # Use LayerNorm instead of BatchNorm for sequence data
+        self.norm = nn.LayerNorm(H, elementwise_affine=False)
+        self.lru = LRULayer(N, H, r_min, r_max, max_phase)
+        self.glu = GLU(H, H)
+        self.dropout = nn.Dropout(p=drop_rate)
 
-    norm: eqx.nn.BatchNorm
-    lru: LRULayer
-    glu: GLU
-    drop: eqx.nn.Dropout
-
-    def __init__(self, N, H, r_min=0, r_max=1, max_phase=6.28, drop_rate=0.1, *, key):
-        lrukey, glukey = jr.split(key, 2)
-        self.norm = eqx.nn.BatchNorm(
-            input_size=H, axis_name="batch", channelwise_affine=False
-        )
-        self.lru = LRULayer(N, H, r_min, r_max, max_phase, key=lrukey)
-        self.glu = GLU(H, H, key=glukey)
-        self.drop = eqx.nn.Dropout(p=drop_rate)
-
-    def __call__(self, x, state, *, key):
-        dropkey1, dropkey2 = jr.split(key, 2)
+    def forward(self, x):
+        """
+        Forward pass of LRU block.
+        
+        Args:
+            x: Input tensor of shape (L, H)
+            
+        Returns:
+            Output tensor of shape (L, H)
+        """
         skip = x
-        x, state = self.norm(x.T, state)
-        x = x.T
+        
+        # Layer normalization
+        x = self.norm(x)
+        
+        # LRU layer
         x = self.lru(x)
-        x = self.drop(jax.nn.gelu(x), key=dropkey1)
-        x = jax.vmap(self.glu)(x)
-        x = self.drop(x, key=dropkey2)
+        
+        # GELU activation + dropout
+        x = self.dropout(F.gelu(x))
+        
+        # GLU (applied to each timestep)
+        x = self.glu(x)
+        
+        # Dropout + residual connection
+        x = self.dropout(x)
         x = skip + x
-        return x, state
+        
+        return x
 
 
-class LRU(eqx.Module):
-    linear_encoder: eqx.nn.Linear
-    blocks: List[LRUBlock]
-    linear_layer: eqx.nn.Linear
-    classification: bool
-    output_step: int
-    stateful: bool = True
-    nondeterministic: bool = True
-    lip2: bool = False
-
+class LRU(nn.Module):
     def __init__(
         self,
         num_blocks,
@@ -151,30 +206,98 @@ class LRU(eqx.Module):
         r_max=1,
         max_phase=6.28,
         drop_rate=0.1,
-        *,
-        key
     ):
-        linear_encoder_key, *block_keys, linear_layer_key = jr.split(
-            key, num_blocks + 2
-        )
-        self.linear_encoder = eqx.nn.Linear(data_dim, H, key=linear_encoder_key)
-        self.blocks = [
-            LRUBlock(N, H, r_min, r_max, max_phase, drop_rate, key=key)
-            for key in block_keys
-        ]
-        self.linear_layer = eqx.nn.Linear(H, output_dim, key=linear_layer_key)
+        super().__init__()
+        
+        self.linear_encoder = nn.Linear(data_dim, H)
+        self.blocks = nn.ModuleList([
+            LRUBlock(N, H, r_min, r_max, max_phase, drop_rate)
+            for _ in range(num_blocks)
+        ])
+        self.linear_layer = nn.Linear(H, output_dim)
         self.classification = classification
         self.output_step = output_step
+        
+        # Stateful attributes to match original interface
+        self.stateful = True
+        self.nondeterministic = True
+        self.lip2 = False
 
-    def __call__(self, x, state, key):
-        dropkeys = jr.split(key, len(self.blocks))
-        x = jax.vmap(self.linear_encoder)(x)
-        for block, key in zip(self.blocks, dropkeys):
-            x, state = block(x, state, key=key)
+    def forward(self, x):
+        """
+        Forward pass of LRU model.
+        
+        Args:
+            x: Input tensor of shape (L, data_dim) where L is sequence length
+            
+        Returns:
+            Output predictions
+        """
+        # Encode input
+        x = self.linear_encoder(x)  # (L, H)
+        
+        # Apply LRU blocks
+        for block in self.blocks:
+            x = block(x)
+        
         if self.classification:
-            x = jnp.mean(x, axis=0)
-            x = jax.nn.softmax(self.linear_layer(x), axis=0)
+            # For classification: average over sequence dimension
+            x = torch.mean(x, dim=0)  # (H,)
+            x = F.softmax(self.linear_layer(x), dim=0)
         else:
-            x = x[self.output_step - 1 :: self.output_step]
-            x = jax.nn.tanh(jax.vmap(self.linear_layer)(x))
-        return x, state
+            # For regression: subsample and apply tanh
+            x = x[self.output_step - 1::self.output_step]  # Subsample
+            x = torch.tanh(self.linear_layer(x))
+        
+        return x
+
+
+# Utility function for complex parameter initialization
+def complex_glorot_uniform(shape, dtype=torch.complex64):
+    """
+    Initialize complex parameters with Glorot uniform distribution.
+    
+    Args:
+        shape: Shape of parameter tensor
+        dtype: Complex dtype
+        
+    Returns:
+        Complex tensor initialized with Glorot uniform
+    """
+    if len(shape) < 2:
+        fan_in = fan_out = shape[0]
+    else:
+        fan_in = shape[-2]
+        fan_out = shape[-1]
+    
+    bound = math.sqrt(6.0 / (fan_in + fan_out))
+    
+    real_part = torch.empty(shape).uniform_(-bound, bound)
+    imag_part = torch.empty(shape).uniform_(-bound, bound)
+    
+    return torch.complex(real_part, imag_part)
+
+
+def complex_glorot_normal(shape, dtype=torch.complex64):
+    """
+    Initialize complex parameters with Glorot normal distribution.
+    
+    Args:
+        shape: Shape of parameter tensor
+        dtype: Complex dtype
+        
+    Returns:
+        Complex tensor initialized with Glorot normal
+    """
+    if len(shape) < 2:
+        fan_in = fan_out = shape[0]
+    else:
+        fan_in = shape[-2]
+        fan_out = shape[-1]
+    
+    std = math.sqrt(2.0 / (fan_in + fan_out))
+    
+    real_part = torch.randn(shape) * std
+    imag_part = torch.randn(shape) * std
+    
+    return torch.complex(real_part, imag_part)

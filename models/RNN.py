@@ -1,5 +1,5 @@
 """
-This module implements the `RNN` class and various RNN cell classes using JAX and Equinox. The `RNN`
+This module implements the `RNN` class and various RNN cell classes using PyTorch. The `RNN`
 class is designed to handle both classification and regression tasks, and can be configured with different
 types of RNN cells.
 
@@ -20,119 +20,244 @@ RNN Cell Classes:
 
 Each RNN cell class implements the following methods:
 - `__init__`: Initialises the RNN cell with the specified input dimensions and hidden state size.
-- `__call__`: Applies the RNN cell to the input and hidden state, returning the updated hidden state.
+- `forward`: Applies the RNN cell to the input and hidden state, returning the updated hidden state.
 
 The `RNN` class also includes:
-- A `__call__` method that processes a sequence of inputs, returning either the final output for classification or a
+- A `forward` method that processes a sequence of inputs, returning either the final output for classification or a
 sequence of outputs for regression.
 """
 
 import abc
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Union, Tuple, Optional
 
-import equinox as eqx
-import jax
-import jax.numpy as jnp
+
+class MLP(nn.Module):
+    """Multi-layer perceptron with customizable activation functions."""
+    
+    def __init__(self, in_size, out_size, width_size, depth, activation=F.relu, final_activation=None):
+        super().__init__()
+        
+        if depth == 0:
+            self.layers = nn.ModuleList([nn.Linear(in_size, out_size)])
+        else:
+            layers = [nn.Linear(in_size, width_size)]
+            for _ in range(depth - 1):
+                layers.append(nn.Linear(width_size, width_size))
+            layers.append(nn.Linear(width_size, out_size))
+            self.layers = nn.ModuleList(layers)
+        
+        self.activation = activation
+        self.final_activation = final_activation
+        
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            if i < len(self.layers) - 1:
+                x = self.activation(x)
+            else:
+                if self.final_activation is not None:
+                    x = self.final_activation(x)
+        return x
 
 
-class _AbstractRNNCell(eqx.Module):
+class _AbstractRNNCell(nn.Module, abc.ABC):
     """Abstract RNN Cell class."""
 
-    cell: eqx.Module
-    hidden_size: int
+    def __init__(self):
+        super().__init__()
+        self.hidden_size = None
 
     @abc.abstractmethod
-    def __init__(self, data_dim, hidden_dim, *, key):
+    def forward(self, state, input_tensor):
+        """
+        Apply the RNN cell to input and hidden state.
+        
+        Args:
+            state: Hidden state (or tuple of states for LSTM)
+            input_tensor: Input tensor
+            
+        Returns:
+            Updated hidden state (or tuple of states for LSTM)
+        """
         raise NotImplementedError
 
-    @abc.abstractmethod
-    def __call__(self, state, input):
-        raise NotImplementedError
 
-
-class LinearCell(_AbstractRNNCell):
-    cell: eqx.nn.Linear
-    hidden_size: int
-
-    def __init__(self, data_dim, hidden_dim, *, key):
-        self.cell = eqx.nn.Linear(data_dim + hidden_dim, hidden_dim, key=key)
+class LinearCell(_AbstractRNNCell):    
+    def __init__(self, data_dim, hidden_dim):
+        super().__init__()
+        self.cell = nn.Linear(data_dim + hidden_dim, hidden_dim)
         self.hidden_size = hidden_dim
 
-    def __call__(self, state, input):
-        return self.cell(jnp.concatenate([state, input]))
+    def forward(self, state, input_tensor):
+        """
+        Args:
+            state: Hidden state tensor of shape (hidden_dim,)
+            input_tensor: Input tensor of shape (data_dim,)
+            
+        Returns:
+            Updated hidden state of shape (hidden_dim,)
+        """
+        concatenated = torch.cat([state, input_tensor], dim=-1)
+        return self.cell(concatenated)
 
 
 class GRUCell(_AbstractRNNCell):
-    cell: eqx.nn.GRUCell
-    hidden_size: int
-
-    def __init__(self, data_dim, hidden_dim, *, key):
-        self.cell = eqx.nn.GRUCell(data_dim, hidden_dim, key=key)
+    """Gated Recurrent Unit cell."""
+    
+    def __init__(self, data_dim, hidden_dim):
+        super().__init__()
+        self.cell = nn.GRUCell(data_dim, hidden_dim)
         self.hidden_size = hidden_dim
 
-    def __call__(self, state, input):
-        return self.cell(input, state)
+    def forward(self, state, input_tensor):
+        """
+        Args:
+            state: Hidden state tensor of shape (batch_size, hidden_dim) or (hidden_dim,)
+            input_tensor: Input tensor of shape (batch_size, data_dim) or (data_dim,)
+            
+        Returns:
+            Updated hidden state
+        """
+        # Ensure tensors have batch dimension for GRUCell
+        if input_tensor.dim() == 1:
+            input_tensor = input_tensor.unsqueeze(0)
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+            
+        new_state = self.cell(input_tensor, state)
+        
+        # Remove batch dimension if it was added
+        if new_state.shape[0] == 1:
+            new_state = new_state.squeeze(0)
+            
+        return new_state
 
 
 class LSTMCell(_AbstractRNNCell):
-    cell: eqx.nn.LSTMCell
-    hidden_size: int
-
-    def __init__(self, data_dim, hidden_dim, *, key):
-        self.cell = eqx.nn.LSTMCell(data_dim, hidden_dim, key=key)
+    """Long Short-Term Memory cell."""
+    
+    def __init__(self, data_dim, hidden_dim):
+        super().__init__()
+        self.cell = nn.LSTMCell(data_dim, hidden_dim)
         self.hidden_size = hidden_dim
 
-    def __call__(self, state, input):
-        return self.cell(input, state)
+    def forward(self, state, input_tensor):
+        """
+        Args:
+            state: Tuple of (hidden_state, cell_state)
+            input_tensor: Input tensor
+            
+        Returns:
+            Tuple of (new_hidden_state, new_cell_state)
+        """
+        hidden_state, cell_state = state
+        
+        # Ensure tensors have batch dimension for LSTMCell
+        if input_tensor.dim() == 1:
+            input_tensor = input_tensor.unsqueeze(0)
+        if hidden_state.dim() == 1:
+            hidden_state = hidden_state.unsqueeze(0)
+            cell_state = cell_state.unsqueeze(0)
+            
+        new_hidden, new_cell = self.cell(input_tensor, (hidden_state, cell_state))
+        
+        # Remove batch dimension if it was added
+        if new_hidden.shape[0] == 1:
+            new_hidden = new_hidden.squeeze(0)
+            new_cell = new_cell.squeeze(0)
+            
+        return (new_hidden, new_cell)
 
 
 class MLPCell(_AbstractRNNCell):
-    cell: eqx.nn.MLP
-    hidden_size: int
-
-    def __init__(self, data_dim, hidden_dim, depth, width, *, key):
-        self.cell = eqx.nn.MLP(data_dim + hidden_dim, hidden_dim, width, depth, key=key)
+    """Multi-layer perceptron RNN cell."""
+    
+    def __init__(self, data_dim, hidden_dim, depth, width):
+        super().__init__()
+        self.cell = MLP(data_dim + hidden_dim, hidden_dim, width, depth)
         self.hidden_size = hidden_dim
 
-    def __call__(self, state, input):
-        return self.cell(jnp.concatenate([state, input]))
+    def forward(self, state, input_tensor):
+        """
+        Args:
+            state: Hidden state tensor of shape (hidden_dim,)
+            input_tensor: Input tensor of shape (data_dim,)
+            
+        Returns:
+            Updated hidden state of shape (hidden_dim,)
+        """
+        concatenated = torch.cat([state, input_tensor], dim=-1)
+        return self.cell(concatenated)
 
 
-class RNN(eqx.Module):
-    cell: _AbstractRNNCell
-    output_layer: eqx.nn.Linear
-    hidden_dim: int
-    classification: bool
-    stateful: bool = False
-    nondeterministic: bool = False
-    lip2: bool = False
-    output_step: int
-
+class RNN(nn.Module):
     def __init__(
-        self, cell, hidden_dim, label_dim, classification=True, output_step=1, *, key
+        self, 
+        cell: _AbstractRNNCell, 
+        hidden_dim: int, 
+        label_dim: int, 
+        classification: bool = True, 
+        output_step: int = 1
     ):
+        super().__init__()
+        
         self.cell = cell
-        self.output_layer = eqx.nn.Linear(
-            hidden_dim, label_dim, use_bias=False, key=key
-        )
-        self.hidden_dim = self.cell.hidden_size
+        self.output_layer = nn.Linear(hidden_dim, label_dim, bias=False)
+        self.hidden_dim = cell.hidden_size
         self.classification = classification
         self.output_step = output_step
+        
+        # Stateful attributes to match original interface
+        self.stateful = False
+        self.nondeterministic = False
+        self.lip2 = False
 
-    def __call__(self, x):
-        hidden = jnp.zeros((self.hidden_dim,))
-        hidden = (hidden,) * 2 if isinstance(self.cell, LSTMCell) else hidden
-
-        scan_fn = lambda state, input: (
-            self.cell(state, input),
-            self.cell(state, input),
-        )
-        final_state, all_states = jax.lax.scan(scan_fn, hidden, x)
-
-        final_state = final_state[0] if isinstance(self.cell, LSTMCell) else final_state
-        all_states = all_states[0] if isinstance(self.cell, LSTMCell) else all_states
-
-        if self.classification:
-            return jax.nn.softmax(self.output_layer(final_state), axis=0)
+    def forward(self, x):
+        """
+        Forward pass of RNN.
+        
+        Args:
+            x: Input sequence tensor of shape (seq_len, data_dim)
+            
+        Returns:
+            Output predictions
+        """
+        seq_len = x.shape[0]
+        
+        # Initialize hidden state
+        if isinstance(self.cell, LSTMCell):
+            hidden = (
+                torch.zeros(self.hidden_dim, dtype=x.dtype, device=x.device),
+                torch.zeros(self.hidden_dim, dtype=x.dtype, device=x.device)
+            )
         else:
-            all_states = all_states[self.output_step - 1 :: self.output_step]
-            return jax.nn.tanh(jax.vmap(self.output_layer)(all_states))
+            hidden = torch.zeros(self.hidden_dim, dtype=x.dtype, device=x.device)
+        
+        # Store all hidden states for regression tasks
+        all_states = []
+        
+        # Process sequence step by step
+        for t in range(seq_len):
+            hidden = self.cell(hidden, x[t])
+            
+            # Store hidden state (extract hidden part for LSTM)
+            if isinstance(self.cell, LSTMCell):
+                all_states.append(hidden[0])  # hidden state (not cell state)
+            else:
+                all_states.append(hidden)
+        
+        # Convert list to tensor
+        all_states = torch.stack(all_states)  # (seq_len, hidden_dim)
+        
+        if self.classification:
+            # Use final state for classification
+            final_state = all_states[-1]
+            return F.softmax(self.output_layer(final_state), dim=0)
+        else:
+            # Subsample states for regression
+            sampled_states = all_states[self.output_step - 1::self.output_step]
+            outputs = torch.tanh(self.output_layer(sampled_states))
+            return outputs
